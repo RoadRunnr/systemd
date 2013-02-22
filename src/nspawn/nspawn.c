@@ -72,6 +72,7 @@ static char *arg_user = NULL;
 static char **arg_controllers = NULL;
 static char *arg_uuid = NULL;
 static bool arg_private_network = false;
+static char ***arg_network_if = NULL;
 static bool arg_read_only = false;
 static bool arg_boot = false;
 static LinkJournal arg_link_journal = LINK_AUTO;
@@ -114,6 +115,7 @@ static int help(void) {
                "  -C --controllers=LIST   Put the container in specified comma-separated cgroup hierarchies\n"
                "     --uuid=UUID          Set a specific machine UUID for the container\n"
                "     --private-network    Disable network in container\n"
+               "     --network-if         Add a virtual interface to the container\n"
                "     --read-only          Mount the root directory read-only\n"
                "     --capability=CAP     In addition to the default, retain specified capability\n"
                "     --link-journal=MODE  Link up guest journal, one of no, auto, guest, host\n"
@@ -131,7 +133,8 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_UUID,
                 ARG_READ_ONLY,
                 ARG_CAPABILITY,
-                ARG_LINK_JOURNAL
+                ARG_LINK_JOURNAL,
+                ARG_NETWORK_IF
         };
 
         static const struct option options[] = {
@@ -141,6 +144,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "user",            required_argument, NULL, 'u'                 },
                 { "controllers",     required_argument, NULL, 'C'                 },
                 { "private-network", no_argument,       NULL, ARG_PRIVATE_NETWORK },
+                { "network-if",      required_argument, NULL, ARG_NETWORK_IF      },
                 { "boot",            no_argument,       NULL, 'b'                 },
                 { "uuid",            required_argument, NULL, ARG_UUID            },
                 { "read-only",       no_argument,       NULL, ARG_READ_ONLY       },
@@ -150,6 +154,8 @@ static int parse_argv(int argc, char *argv[]) {
         };
 
         int c;
+        int if_cnt = 0;
+        char ***p = arg_network_if = calloc(sizeof(char *), 16);
 
         assert(argc >= 0);
         assert(argv);
@@ -199,6 +205,20 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_PRIVATE_NETWORK:
                         arg_private_network = true;
+                        break;
+
+                case ARG_NETWORK_IF:
+                        if (if_cnt >= 16)  {
+                                log_error("Too many interface specification %s", optarg);
+                                return -EINVAL;
+                        }
+                        if (strchr(optarg, ':') == NULL) {
+                                log_error("Invalid interface specification %s", optarg);
+                                return -EINVAL;
+                        }
+
+                        *(p++) = strv_split(optarg, ":");
+                        if_cnt++;
                         break;
 
                 case 'b':
@@ -410,7 +430,7 @@ static int setup_resolv_conf(const char *dest) {
 
         assert(dest);
 
-        if (arg_private_network)
+        if (arg_private_network && *arg_network_if == NULL)
                 return 0;
 
         /* Fix resolv.conf, if possible */
@@ -828,6 +848,21 @@ static int is_os_tree(const char *path) {
         free(p);
 
         return r < 0 ? 0 : 1;
+}
+
+static int setup_private_network(int pid) {
+
+        for (char ***p = arg_network_if; p; p++) {
+                char cmd[PATH_MAX];
+
+                snprintf(cmd, sizeof(cmd), "/sbin/ip link add name %s type veth peer name %s", (*p)[0], (*p)[1]);
+                system(cmd);
+
+                snprintf(cmd, sizeof(cmd), "/sbin/ip link set %s netns %d", (*p)[1], pid);
+                system(cmd);
+        }
+
+        return 0;
 }
 
 static int process_pty(int master, pid_t pid, sigset_t *mask) {
@@ -1491,6 +1526,9 @@ int main(int argc, char *argv[]) {
                 child_fail:
                         _exit(EXIT_FAILURE);
                 }
+
+                if (arg_private_network)
+                        setup_private_network(pid);
 
                 log_info("Init process in the container running as PID %d", pid);
                 close_nointr_nofail(pipefd[0]);
